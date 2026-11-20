@@ -13,16 +13,21 @@
 // - Receive-pack caps: report-status, report-status-v2, side-band-64k, delete-refs, ofs-delta,
 //   symref=HEAD:refs/heads/main (checks-git.ts:410). Upload-pack v0 caps: side-band-64k (the
 //   client throws without it, :1729), shallow, thin-pack, ofs-delta, multi_ack_detailed, symref.
-// - v2 fetch response sections, in order, each flush-terminated: acknowledgments (NAK),
-//   shallow-info (only when there are lines), packfile (sideband packets only; >= 1 packet even
-//   for an empty pack, else parseV2Fetch throws, :1614). `packfile-uris` is NEVER sent.
+// - v2 fetch response sections, in order: acknowledgments (NAK), shallow-info (only when
+//   there are lines), packfile (sideband packets only; >= 1 packet even for an empty pack,
+//   else parseV2Fetch throws, :1614). Sections are separated by DELIM (0001) packets and the
+//   whole response ends with a FLUSH (0000) — protocol-v2.txt. A flush between sections is
+//   WRONG: real git then dies "expected 'packfile', received 'acknowledgments'".
+//   `packfile-uris` is NEVER sent.
 // - v0 fetch response: plain pkt-lines `NAK` / `shallow <oid>` / `unshallow <oid>` interleaved
 //   with sideband packets (band 1 = pack data), then flush.
 // - Push report: `unpack ok\n` + one `ok <ref>\n` / `ng <ref> <reason>\n` per command, in order.
 //   The `ng` reason for a refused update is exactly `non-fast-forward` (checks-git.ts:865).
 //   A refused push MUST still unpack: objects are stored before refs are evaluated (:865).
 //   When side-band-64k is negotiated the report stream is pkt-lined INSIDE band-1 packets.
-// - Packs: plain objects only, no deltas (pack-deltas passes with deltaCount 0, checks-git.ts:1003),
+// - Packs: SENT as plain objects only, no deltas (pack-deltas passes with deltaCount 0,
+//   checks-git.ts:1003); RECEIVED packs may carry OFS/REF deltas — real git sends them —
+//   and parsePack resolves them (thin packs included: a REF_DELTA base may already be stored).
 //   version 2, trailer = SHA-1 of all preceding bytes, each oid at most once.
 // - HEAD is hidden whenever a ref-prefix is given in ls-refs (the ls-refs-prefix trap, :508).
 // - Robustness: any malformed git request is answered 400 without touching the store and
@@ -53,6 +58,8 @@ function pktLine(payload: Buffer | string): Buffer {
 }
 
 const pktFlush = (): Buffer => Buffer.from('0000', 'ascii');
+/** Delimiter packet (0001): separates sections inside a protocol-v2 response. */
+const pktDelim = (): Buffer => Buffer.from('0001', 'ascii');
 
 interface PktPacket {
   kind: 'data' | 'flush' | 'delim' | 'response-end';
@@ -138,12 +145,98 @@ function buildPack(objects: Map<string, GitObject>): Buffer {
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
 }
 
+/** Decode an OFS_DELTA base offset (the negative-offset varint after the entry header). */
+function readOfsDeltaBase(buf: Buffer, start: number): { baseOffset: number; next: number } {
+  if (start >= buf.length) throw new Error('ofs-delta has no base offset');
+  let byte = buf[start];
+  let off = start + 1;
+  let value = byte & 0x7f;
+  while (byte & 0x80) {
+    if (off >= buf.length) throw new Error('ofs-delta base offset is truncated');
+    byte = buf[off++];
+    value = ((value + 1) * 128) + (byte & 0x7f);
+  }
+  return { baseOffset: value, next: off };
+}
+
 /**
- * Parse + verify a pushed pack. Throws on any defect (bad header, bad trailer, delta entry,
- * size mismatch, stray bytes, conflicting duplicate). Mirrors the client's readPack
- * (git-client.ts:707) and inflateAt (:615, inflateSync with {info:true} + bytesWritten).
+ * Apply a git delta (copy/insert instruction stream) to a base object's bytes.
+ * Format: source-size varint, target-size varint, then opcodes — 0x80 bit set = copy
+ * (offset/size bytes selected by the low 7 bits), otherwise a literal insert of that many
+ * bytes. Standard git delta format; mirrors the kit client's applyDelta.
  */
-function parsePack(buf: Buffer): Map<string, GitObject> {
+function applyDelta(base: Buffer, delta: Buffer): Buffer {
+  let off = 0;
+  const readSize = (): number => {
+    let value = 0;
+    let shift = 0;
+    for (;;) {
+      if (off >= delta.length) throw new Error('delta size varint is truncated');
+      const byte = delta[off++];
+      value += (byte & 0x7f) * 2 ** shift;
+      shift += 7;
+      if (!(byte & 0x80)) break;
+      if (shift > 63) throw new Error('delta size varint is too long');
+    }
+    return value;
+  };
+  const sourceSize = readSize();
+  const targetSize = readSize();
+  if (sourceSize !== base.length) {
+    throw new Error(`delta expects a ${sourceSize}-byte base, got ${base.length}`);
+  }
+  const out = Buffer.allocUnsafe(targetSize);
+  let written = 0;
+  while (off < delta.length) {
+    const op = delta[off++];
+    if (op & 0x80) {
+      let copyOffset = 0;
+      let copySize = 0;
+      let shift = 0;
+      for (let bit = 0; bit < 4; bit += 1) {
+        if (op & (1 << bit)) {
+          if (off >= delta.length) throw new Error('delta copy offset is truncated');
+          copyOffset += delta[off++] * 2 ** shift;
+        }
+        shift += 8;
+      }
+      shift = 0;
+      for (let bit = 4; bit < 7; bit += 1) {
+        if (op & (1 << bit)) {
+          if (off >= delta.length) throw new Error('delta copy size is truncated');
+          copySize += delta[off++] * 2 ** shift;
+        }
+        shift += 8;
+      }
+      if (copySize === 0) copySize = 0x10000;
+      if (copyOffset + copySize > base.length) throw new Error('delta copy is out of the base');
+      if (written + copySize > targetSize) throw new Error('delta writes past its target size');
+      base.copy(out, written, copyOffset, copyOffset + copySize);
+      written += copySize;
+    } else if (op !== 0) {
+      const literal = op & 0x7f;
+      if (off + literal > delta.length) throw new Error('delta insert is truncated');
+      if (written + literal > targetSize) throw new Error('delta writes past its target size');
+      delta.copy(out, written, off, off + literal);
+      off += literal;
+      written += literal;
+    } else {
+      throw new Error('delta opcode 0 is invalid');
+    }
+  }
+  if (written !== targetSize) throw new Error(`delta produced ${written} of ${targetSize} bytes`);
+  return out;
+}
+
+/**
+ * Parse + verify a pushed pack, resolving OFS_DELTA (type 6) and REF_DELTA (type 7)
+ * entries. A REF_DELTA base may be an object the server already stores (thin pack), so
+ * `resolveBase` looks it up in the repo; an OFS_DELTA base is always an earlier entry in
+ * the same pack. Throws on any defect (bad header, bad trailer, unknown type, size
+ * mismatch, stray bytes, unresolvable base, delta cycle, conflicting duplicate).
+ * Mirrors the kit client's readPack (git-client.ts:707).
+ */
+function parsePack(buf: Buffer, resolveBase?: (oid: string) => GitObject | undefined): Map<string, GitObject> {
   if (buf.length < 32) throw new Error('pack too short');
   if (buf.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('bad pack header');
   const version = buf.readUInt32BE(4);
@@ -154,14 +247,39 @@ function parsePack(buf: Buffer): Map<string, GitObject> {
   if (createHash('sha1').update(buf.subarray(0, trailerStart)).digest('hex') !== trailer) {
     throw new Error('pack trailer checksum mismatch');
   }
-  const out = new Map<string, GitObject>();
+  interface RawEntry {
+    offset: number;
+    typeCode: number;
+    size: number;
+    data: Buffer;
+    baseOffset?: number;
+    baseOid?: string;
+    resolvedType?: GitObject['type'];
+    resolved?: Buffer;
+    oid?: string;
+  }
+  const raw: RawEntry[] = [];
+  const byOffset = new Map<number, RawEntry>();
   let off = 12;
   for (let i = 0; i < count; i++) {
+    const entryOffset = off;
     const h = readVarint(buf, off);
     off = h.next;
-    const type = CODE_TYPE[h.typeCode];
-    if (!type) throw new Error(`unknown pack object type ${h.typeCode}`);
-    // Delta entries (type 6/7) have no CODE_TYPE entry, so they are rejected above.
+    const entry: RawEntry = { offset: entryOffset, typeCode: h.typeCode, size: h.size, data: Buffer.alloc(0) };
+    if (h.typeCode === 6) {
+      const base = readOfsDeltaBase(buf, off);
+      off = base.next;
+      if (base.baseOffset <= 0 || base.baseOffset > entryOffset) {
+        throw new Error(`ofs-delta at ${entryOffset} names an invalid base offset ${base.baseOffset}`);
+      }
+      entry.baseOffset = entryOffset - base.baseOffset;
+    } else if (h.typeCode === 7) {
+      if (off + 20 > trailerStart) throw new Error('ref-delta base id is truncated');
+      entry.baseOid = buf.subarray(off, off + 20).toString('hex');
+      off += 20;
+    } else if (!CODE_TYPE[h.typeCode]) {
+      throw new Error(`unknown pack object type ${h.typeCode}`);
+    }
     const inflated = inflateSync(buf.subarray(off, trailerStart), { info: true }) as unknown as {
       buffer: Buffer;
       engine: { bytesWritten: number };
@@ -171,12 +289,60 @@ function parsePack(buf: Buffer): Map<string, GitObject> {
     if (!consumed || consumed <= 0) throw new Error('zlib stream consumed no bytes');
     if (data.length !== h.size) throw new Error('object size mismatch');
     off += consumed;
-    const oid = sha1Hex(Buffer.concat([Buffer.from(`${type} ${data.length}\0`, 'utf8'), data]));
-    const prev = out.get(oid);
-    if (prev && !prev.data.equals(data)) throw new Error('conflicting duplicate object');
-    out.set(oid, { type: type as GitObject['type'], data });
+    entry.data = data;
+    raw.push(entry);
+    byOffset.set(entryOffset, entry);
   }
   if (off !== trailerStart) throw new Error('pack has stray bytes');
+
+  const out = new Map<string, GitObject>();
+  const resolvedByOid = new Map<string, RawEntry>();
+  const resolving = new Set<number>();
+  const resolve = (entry: RawEntry): { type: GitObject['type']; data: Buffer; oid: string } => {
+    if (entry.resolved !== undefined && entry.resolvedType !== undefined && entry.oid !== undefined) {
+      return { type: entry.resolvedType, data: entry.resolved, oid: entry.oid };
+    }
+    if (resolving.has(entry.offset)) throw new Error(`delta cycle at pack offset ${entry.offset}`);
+    resolving.add(entry.offset);
+    let type: GitObject['type'];
+    let data: Buffer;
+    if (entry.typeCode === 6) {
+      const baseEntry = byOffset.get(entry.baseOffset!);
+      if (!baseEntry) throw new Error(`ofs-delta base at offset ${entry.baseOffset} is not in the pack`);
+      const base = resolve(baseEntry);
+      type = base.type;
+      data = applyDelta(base.data, entry.data);
+    } else if (entry.typeCode === 7) {
+      const wanted = entry.baseOid!;
+      const baseEntry = resolvedByOid.get(wanted);
+      if (baseEntry) {
+        const base = resolve(baseEntry);
+        type = base.type;
+        data = applyDelta(base.data, entry.data);
+      } else {
+        const external = resolveBase?.(wanted);
+        if (!external) throw new Error(`ref-delta base ${wanted} is neither in the pack nor stored`);
+        type = external.type;
+        data = applyDelta(external.data, entry.data);
+      }
+    } else {
+      type = CODE_TYPE[entry.typeCode] as GitObject['type'];
+      data = entry.data;
+    }
+    const oid = sha1Hex(Buffer.concat([Buffer.from(`${type} ${data.length}\0`, 'utf8'), data]));
+    entry.resolved = data;
+    entry.resolvedType = type;
+    entry.oid = oid;
+    resolvedByOid.set(oid, entry);
+    resolving.delete(entry.offset);
+    return { type, data, oid };
+  };
+  for (const entry of raw) {
+    const resolved = resolve(entry);
+    const prev = out.get(resolved.oid);
+    if (prev && !prev.data.equals(resolved.data)) throw new Error('conflicting duplicate object');
+    out.set(resolved.oid, { type: resolved.type, data: resolved.data });
+  }
   return out;
 }
 
@@ -314,9 +480,13 @@ function computeFetch(
     const obj = repo.objects.get(oid);
     if (!obj || obj.type !== 'commit') continue;
     levels.set(oid, level);
+    // The depth limit stops the walk here, so this commit is a shallow boundary — even when
+    // it has no parents (a root commit fetched with deepen 1 is still shallow: a real git
+    // --depth 1 clone of a 1-commit repo writes it to .git/shallow). A full fetch
+    // (maxLevel = Infinity) never marks a boundary.
+    if (level === maxLevel) boundary.add(oid);
     for (const p of commitParents(repo, oid)) {
-      if (level + 1 > maxLevel) boundary.add(oid);
-      else queue.push({ oid: p, level: level + 1 });
+      if (level + 1 <= maxLevel) queue.push({ oid: p, level: level + 1 });
     }
   }
   // 3. Included objects: wanted commits + their full tree closures + extra wants.
@@ -501,8 +671,13 @@ function handleLsRefs(repo: Repo, args: string[]): Buffer {
     .map((a) => a.slice('ref-prefix '.length));
   const out: Buffer[] = [];
   const mainTip = repo.refs.get('main') ?? null;
-  // HEAD is sent only when no ref-prefix is given (the ls-refs-prefix trap).
-  if (prefixes.length === 0) {
+  // HEAD is a ref named "HEAD" for prefix matching: it is sent when no prefix is given, or
+  // when some prefix matches it (a clone asks for `ref-prefix HEAD` and needs the symref to
+  // pick the default branch — hiding it then leaves the clone detached with no checkout).
+  // A prefix like `refs/heads/` does NOT match HEAD, so the suite's ls-refs-prefix check
+  // (heads/tags prefixes, HEAD hidden) still passes.
+  const headWanted = prefixes.length === 0 || prefixes.some((p) => 'HEAD'.startsWith(p));
+  if (headWanted) {
     const sym = wantSymrefs ? ' symref-target:refs/heads/main' : '';
     out.push(pktLine(mainTip ? `${mainTip} HEAD${sym}\n` : `unborn HEAD${sym}\n`));
   }
@@ -526,24 +701,43 @@ function parseFetchArgs(lines: string[]): {
   haves: string[];
   shallows: string[];
   deepen: number | null;
+  done: boolean;
 } {
   const wants: string[] = [];
   const haves: string[] = [];
   const shallows: string[] = [];
   let deepen: number | null = null;
+  let done = false;
   for (const raw of lines) {
     const line = raw.replace(/\n$/, '');
     if (line.startsWith('want ')) wants.push(line.slice(5, 45));
     else if (line.startsWith('have ')) haves.push(line.slice(5, 45));
     else if (line.startsWith('shallow ')) shallows.push(line.slice(8, 48));
+    else if (line === 'done') done = true;
     else if (line.startsWith('deepen ')) {
       const n = parseInt(line.slice(7), 10);
       if (Number.isFinite(n) && n > 0) deepen = n;
     }
-    // thin-pack, no-progress, ofs-delta, filter, deepen-since, deepen-not, done:
+    // thin-pack, no-progress, ofs-delta, filter, deepen-since, deepen-not:
     // accepted and ignored (the server always sends full plain objects).
   }
-  return { wants, haves, shallows, deepen };
+  return { wants, haves, shallows, deepen, done };
+}
+
+/**
+ * The common-base acknowledgment for a fetch: the first have (in request order) that the
+ * server has and that is an ancestor-or-self of a want. The server MUST ACK a real common
+ * base — answering NAK when one exists breaks real git (see handleFetchV2).
+ */
+function findAck(repo: Repo, wants: string[], haves: string[]): string | null {
+  for (const h of haves) {
+    const obj = repo.objects.get(h);
+    if (!obj || obj.type !== 'commit') continue;
+    for (const w of wants) {
+      if (isAncestor(repo, h, w)) return h;
+    }
+  }
+  return null;
 }
 
 /** Split a v2 upload-pack body into the command block and the args after the delim. */
@@ -575,6 +769,7 @@ function parseV0Fetch(body: Buffer): {
   haves: string[];
   shallows: string[];
   deepen: number | null;
+  done: boolean;
 } {
   const packets = decodePktLines(body);
   const sections: string[][] = [[]];
@@ -587,7 +782,7 @@ function parseV0Fetch(body: Buffer): {
   }
   const first = parseFetchArgs(sections[0] ?? []);
   const second = parseFetchArgs(sections[1] ?? []);
-  return { wants: first.wants, haves: second.haves, shallows: first.shallows, deepen: first.deepen };
+  return { wants: first.wants, haves: second.haves, shallows: first.shallows, deepen: first.deepen, done: second.done };
 }
 
 /** Chop a pack into band-1 sideband packets (never an empty packet). */
@@ -604,12 +799,34 @@ function handleFetchV2(repo: Repo, args: string[]): Buffer {
   const req = parseFetchArgs(args);
   const plan = computeFetch(repo, req.wants, req.haves, req.shallows, req.deepen);
   const pack = buildPack(plan.objects);
-  const chunks: Buffer[] = [pktLine('acknowledgments\n'), pktLine('NAK\n'), pktFlush()];
+  // Negotiation round: the client sent haves but not `done` yet. Answer ONLY the
+  // acknowledgments section and end the response. The client then sends a follow-up
+  // request with `done`, and that round gets the packfile below. Sending the packfile
+  // in this round makes real git die ("expected no other sections to be sent after
+  // no 'ready'") — it expects the response to end after the acknowledgments so it can
+  // send `done`. (The kit client always sends `done` in its first request, so it never
+  // takes this branch.)
+  if (req.haves.length > 0 && !req.done) {
+    const ack = findAck(repo, req.wants, req.haves);
+    return Buffer.concat([
+      pktLine('acknowledgments\n'),
+      pktLine(ack ? `ACK ${ack} ready\n` : 'NAK\n'),
+      pktFlush(),
+    ]);
+  }
+  // Final round: the client sent `done` (or a clone sent no haves at all). Send the
+  // packfile response with NO acknowledgments section. Real git's follow-up round
+  // expects the response to begin with `shallow-info`/`packfile` — repeating the
+  // acknowledgments dies with "expected 'packfile', received 'acknowledgments'".
+  // The kit client dispatches on section names and no suite check asserts on
+  // ack/nak/ready (checks-git.ts), so omitting the section is safe for it too.
+  // (A fresh clone sends no haves, so there was never an acknowledgments section for it.)
+  const chunks: Buffer[] = [];
   if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
     chunks.push(pktLine('shallow-info\n'));
     for (const s of plan.shallow) chunks.push(pktLine(`shallow ${s}\n`));
     for (const s of plan.unshallow) chunks.push(pktLine(`unshallow ${s}\n`));
-    chunks.push(pktFlush());
+    chunks.push(pktDelim());
   }
   chunks.push(pktLine('packfile\n'));
   chunks.push(...sidebandChunks(pack));
@@ -621,7 +838,8 @@ function handleFetchV0(repo: Repo, body: Buffer): Buffer {
   const req = parseV0Fetch(body);
   const plan = computeFetch(repo, req.wants, req.haves, req.shallows, req.deepen);
   const pack = buildPack(plan.objects);
-  const chunks: Buffer[] = [pktLine('NAK\n')];
+  const ack = req.haves.length > 0 ? findAck(repo, req.wants, req.haves) : null;
+  const chunks: Buffer[] = [pktLine(ack ? `ACK ${ack}\n` : 'NAK\n')];
   for (const s of plan.shallow) chunks.push(pktLine(`shallow ${s}\n`));
   for (const s of plan.unshallow) chunks.push(pktLine(`unshallow ${s}\n`));
   chunks.push(...sidebandChunks(pack));
@@ -665,10 +883,15 @@ function applyCommand(repo: Repo, cmd: PushCommand): { ok: boolean; reason: stri
 function wrapPushReport(lines: string[], sideband: boolean): Buffer {
   const text = Buffer.concat(lines.map((l) => pktLine(l)));
   if (!sideband) return Buffer.concat([text, pktFlush()]);
+  // The demuxed report stream must itself end with a flush pkt-line: git's client reads the
+  // report pkt-lines out of the band-1 stream until a flush, and the flush that ends the
+  // sideband stream is NOT passed through. Without this inner flush git dies with
+  // "the remote end hung up unexpectedly" right after printing the report lines.
+  const framed = Buffer.concat([text, pktFlush()]);
   const chunks: Buffer[] = [];
-  for (let off = 0; off < text.length; off += SIDEBAND_CHUNK) {
+  for (let off = 0; off < framed.length; off += SIDEBAND_CHUNK) {
     chunks.push(
-      pktLine(Buffer.concat([Buffer.from([1]), text.subarray(off, Math.min(off + SIDEBAND_CHUNK, text.length))])),
+      pktLine(Buffer.concat([Buffer.from([1]), framed.subarray(off, Math.min(off + SIDEBAND_CHUNK, framed.length))])),
     );
   }
   chunks.push(pktFlush());
@@ -715,7 +938,7 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
       unpackError = 'missing pack';
     } else {
       try {
-        const unpacked = parsePack(packBytes);
+        const unpacked = parsePack(packBytes, (oid) => repo.objects.get(oid));
         for (const [oid, obj] of unpacked) {
           if (!repo.objects.has(oid)) repo.objects.set(oid, obj);
           if (obj.type === 'commit') commitParents(repo, oid);
