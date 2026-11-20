@@ -21,6 +21,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createStore, type Store } from './store.ts';
 import { handleGit } from './git.ts';
+import { handleMcp } from './mcp.ts';
 import { handleRest, type RestContext } from './rest.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
@@ -121,9 +122,10 @@ function needsAuth(path: string): boolean {
   );
 }
 
-/** Whether a path carries a JSON body (REST/GraphQL/MCP). Git paths carry binary pkt-lines. */
+/** Whether a path carries a JSON body (REST/GraphQL). MCP parses its own raw body (it must
+ *  answer malformed JSON with JSON-RPC -32700, not the generic 400); git paths are binary. */
 function isJsonRoute(path: string): boolean {
-  return path.startsWith('/api/v3/') || path.startsWith('/api/graphql') || path.startsWith('/mcp');
+  return path.startsWith('/api/v3/') || path.startsWith('/api/graphql');
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
@@ -190,6 +192,21 @@ export function createApp(): Server {
             path,
             query,
             headers: req.headers,
+            rawBody: rawBody ?? Buffer.alloc(0),
+            res,
+            requestId,
+          })
+        ) {
+          return;
+        }
+
+        // MCP (Tahap 4): JSON-RPC 2.0 on POST /mcp; it parses its own raw body (malformed
+        // JSON must answer -32700) and writes its own response. Returns true on /mcp paths.
+        if (
+          handleMcp({
+            store,
+            method,
+            path,
             rawBody: rawBody ?? Buffer.alloc(0),
             res,
             requestId,
