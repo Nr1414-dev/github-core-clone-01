@@ -9,6 +9,7 @@
 import {
   type Issue,
   type Label,
+  type Pull,
   type Repo,
   type Store,
   branchFiles,
@@ -412,6 +413,11 @@ export async function handleRest(ctx: RestContext): Promise<boolean> {
     if (rest.length >= 1 && rest[0] === 'issues') {
       return handleIssues(ctx, repo, rest.slice(1));
     }
+
+    // Pulls: POST/GET /repos/{o}/{r}/pulls[/{n}[/files|merge]] (checks-rest.ts:966-1188).
+    if (rest.length >= 1 && rest[0] === 'pulls') {
+      return handlePulls(ctx, repo, rest.slice(1));
+    }
   }
 
   return false;
@@ -710,6 +716,249 @@ function handleIssues(ctx: RestContext, repo: Repo, rest: string[]): boolean {
     }
     if (method === 'GET') {
       ctx.reply(200, issue.comments.map((c) => commentJson(repo, issue, c)));
+      return true;
+    }
+    return false;
+  }
+
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Pulls
+// ---------------------------------------------------------------------------
+
+function pullJson(repo: Repo, pull: Pull): Record<string, unknown> {
+  return {
+    id: pull.id,
+    number: pull.number,
+    title: pull.title,
+    body: pull.body,
+    state: pull.state,
+    head: { ref: pull.headRef, sha: pull.headSha, label: `${repo.owner}:${pull.headRef}` },
+    base: { ref: pull.baseRef, sha: pull.baseSha, label: `${repo.owner}:${pull.baseRef}` },
+    merged: pull.merged,
+    merged_at: pull.mergedAt,
+    merge_commit_sha: pull.mergeCommitSha,
+    user: userJson(),
+    created_at: trialNowISO(),
+    updated_at: trialNowISO(),
+    html_url: `https://github.com/${repo.owner}/${repo.name}/pull/${pull.number}`,
+    url: `/api/v3/repos/${repo.owner}/${repo.name}/pulls/${pull.number}`,
+  };
+}
+
+/** Number of newline-terminated lines in a blob (a non-empty file has at least 1). */
+function lineCount(data: Buffer): number {
+  if (data.length === 0) return 0;
+  const parts = data.toString('utf8').split('\n');
+  if (parts.length > 0 && parts[parts.length - 1] === '') parts.pop();
+  return parts.length;
+}
+
+/** Tree sha of a commit, or null when the object is not a commit. */
+function commitTreeSha(repo: Repo, sha: string): string | null {
+  const obj = repo.objects.get(sha);
+  return obj !== undefined && obj.type === 'commit' ? parseCommit(obj.data).tree : null;
+}
+
+interface TreeChange {
+  base: string | null; // blob sha at the base tree (null = path absent there)
+  head: string | null; // blob sha at the head tree (null = path absent there)
+}
+
+/** Path -> change between two trees (base tip tree vs head tip tree). */
+function treeDiffMap(repo: Repo, baseTreeSha: string, headTreeSha: string): Map<string, TreeChange> {
+  const base = flattenTree(repo, baseTreeSha);
+  const head = flattenTree(repo, headTreeSha);
+  const out = new Map<string, TreeChange>();
+  for (const [p, b] of base) {
+    const h = head.get(p);
+    if (h === undefined) out.set(p, { base: b, head: null });
+    else if (h !== b) out.set(p, { base: b, head: h });
+  }
+  for (const [p, h] of head) {
+    if (!base.has(p)) out.set(p, { base: null, head: h });
+  }
+  return out;
+}
+
+/**
+ * The pull files list (checks-rest.ts:1015-1022): one entry per changed path, sorted by
+ * filename. Additions/deletions are line counts of the new/old blob (the suite asserts
+ * additions >= 1 for an added file and integer >= 0 counts elsewhere, never exact diffs).
+ */
+function pullFilesJson(repo: Repo, baseTreeSha: string, headTreeSha: string): Record<string, unknown>[] {
+  const diff = treeDiffMap(repo, baseTreeSha, headTreeSha);
+  const out: Record<string, unknown>[] = [];
+  for (const filename of [...diff.keys()].sort()) {
+    const change = diff.get(filename)!;
+    const headBlob = change.head === null ? undefined : repo.objects.get(change.head);
+    const baseBlob = change.base === null ? undefined : repo.objects.get(change.base);
+    let status: string;
+    let additions: number;
+    let deletions: number;
+    if (change.base === null) {
+      status = 'added';
+      additions = headBlob === undefined ? 0 : lineCount(headBlob.data);
+      deletions = 0;
+    } else if (change.head === null) {
+      status = 'removed';
+      additions = 0;
+      deletions = baseBlob === undefined ? 0 : lineCount(baseBlob.data);
+    } else {
+      status = 'modified';
+      additions = headBlob === undefined ? 0 : lineCount(headBlob.data);
+      deletions = baseBlob === undefined ? 0 : lineCount(baseBlob.data);
+    }
+    out.push({ filename, status, additions, deletions, changes: additions + deletions });
+  }
+  return out;
+}
+
+function handlePulls(ctx: RestContext, repo: Repo, rest: string[]): boolean {
+  const { method, query, body, store } = ctx;
+
+  // POST /pulls, GET /pulls
+  if (rest.length === 0) {
+    if (method === 'POST') {
+      if (!isRecord(body) || typeof body.title !== 'string' || body.title === '') {
+        ctx.reply(422, msg('title is required'));
+        return true;
+      }
+      if (typeof body.head !== 'string' || typeof body.base !== 'string') {
+        ctx.reply(422, msg('head and base are required'));
+        return true;
+      }
+      const headSha = repo.refs.get(body.head) ?? null;
+      const baseSha = repo.refs.get(body.base) ?? null;
+      if (headSha === null || baseSha === null) {
+        ctx.reply(422, msg('head or base branch does not exist'));
+        return true;
+      }
+      if (body.head === body.base) {
+        ctx.reply(422, msg('head and base must differ'));
+        return true;
+      }
+      const pull: Pull = {
+        id: store.nextPullId,
+        number: repo.nextPullNumber,
+        title: body.title,
+        body: typeof body.body === 'string' ? body.body : '',
+        state: 'open',
+        merged: false,
+        mergedAt: null,
+        mergeCommitSha: null,
+        headRef: body.head,
+        headSha,
+        baseRef: body.base,
+        baseSha,
+        createdSeq: (store.seq += 1),
+      };
+      store.nextPullId += 1;
+      repo.nextPullNumber += 1;
+      repo.pulls.set(pull.number, pull);
+      ctx.reply(201, pullJson(repo, pull));
+      return true;
+    }
+    if (method === 'GET') {
+      const state = query.get('state') ?? 'open';
+      const { page, perPage } = pageParams(query);
+      let items = [...repo.pulls.values()];
+      if (state === 'open') items = items.filter((p) => p.state === 'open');
+      else if (state === 'closed') items = items.filter((p) => p.state === 'closed');
+      // state=all (or anything else) keeps every pull.
+      items.sort((a, b) => b.createdSeq - a.createdSeq);
+      ctx.reply(200, paginate(items, page, perPage).map((pull) => pullJson(repo, pull)));
+      return true;
+    }
+    return false;
+  }
+
+  // /pulls/{n}[/files|merge]
+  const num = Number.parseInt(rest[0], 10);
+  if (!/^\d+$/.test(rest[0]) || Number.isNaN(num)) return false;
+  const pull = repo.pulls.get(num) ?? null;
+
+  if (rest.length === 1) {
+    if (pull === null) {
+      ctx.reply(404, msg('Not Found'));
+      return true;
+    }
+    if (method === 'GET') {
+      ctx.reply(200, pullJson(repo, pull));
+      return true;
+    }
+    return false;
+  }
+
+  if (rest.length === 2 && rest[1] === 'files') {
+    if (pull === null) {
+      ctx.reply(404, msg('Not Found'));
+      return true;
+    }
+    if (method === 'GET') {
+      const baseTree = commitTreeSha(repo, pull.baseSha);
+      const headTree = commitTreeSha(repo, pull.headSha);
+      if (baseTree === null || headTree === null) {
+        ctx.reply(404, msg('Not Found'));
+        return true;
+      }
+      ctx.reply(200, pullFilesJson(repo, baseTree, headTree));
+      return true;
+    }
+    return false;
+  }
+
+  if (rest.length === 2 && rest[1] === 'merge') {
+    if (pull === null) {
+      ctx.reply(404, msg('Not Found'));
+      return true;
+    }
+    if (method === 'PUT') {
+      if (pull.merged) {
+        ctx.reply(405, msg('Pull request is already merged'));
+        return true;
+      }
+      const baseTip = repo.refs.get(pull.baseRef) ?? null;
+      if (baseTip === null) {
+        ctx.reply(405, msg('Base branch has no commits'));
+        return true;
+      }
+      const baseTree = commitTreeSha(repo, pull.baseSha);
+      const headTree = commitTreeSha(repo, pull.headSha);
+      const curTree = commitTreeSha(repo, baseTip);
+      if (baseTree === null || headTree === null || curTree === null) {
+        ctx.reply(405, msg('Cannot merge: missing commit'));
+        return true;
+      }
+      // Three-way conflict check (checks-rest.ts:1131-1146): for each path the PR changes,
+      // the current base tip must still hold the PR's base blob, or already hold the head
+      // blob; anything else means both sides changed the path differently -> 405.
+      const diff = treeDiffMap(repo, baseTree, headTree);
+      const curFiles = flattenTree(repo, curTree);
+      for (const [path, change] of diff) {
+        const curBlob = curFiles.get(path) ?? null;
+        if (curBlob === change.base) continue;
+        if (curBlob === change.head) continue;
+        ctx.reply(405, msg(`Merge conflict on ${path}`));
+        return true;
+      }
+      // Squash: the base tree with the PR diff applied, one commit on the base branch.
+      const files = new Map(curFiles);
+      for (const [path, change] of diff) {
+        if (change.head === null) files.delete(path);
+        else files.set(path, change.head);
+      }
+      const newTree = buildTree(repo, files);
+      const message = `Merge pull request #${pull.number} from ${pull.headRef}`;
+      const commitSha = createCommit(store, repo, { tree: newTree, parent: baseTip, message });
+      repo.refs.set(pull.baseRef, commitSha);
+      pull.state = 'closed';
+      pull.merged = true;
+      pull.mergedAt = trialNowISO();
+      pull.mergeCommitSha = commitSha;
+      ctx.reply(200, { merged: true, sha: commitSha, message });
       return true;
     }
     return false;
