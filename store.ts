@@ -32,7 +32,7 @@ export function gitBlobSha(content: Buffer): string {
   return sha1Hex(Buffer.concat([Buffer.from(`blob ${content.length}\0`, 'utf8'), content]));
 }
 
-export type GitObjectType = 'blob' | 'tree' | 'commit';
+export type GitObjectType = 'blob' | 'tree' | 'commit' | 'tag';
 
 export interface GitObject {
   type: GitObjectType;
@@ -87,6 +87,10 @@ export interface Repo {
   createdSeq: number;
   /** Branch name -> tip commit sha (null = unborn, no commit yet). */
   refs: Map<string, string | null>;
+  /** Tag name -> tag-object sha (refs/tags/*). */
+  tags: Map<string, string>;
+  /** Commit sha -> parent shas (memo for git ancestor walks). */
+  parents: Map<string, string[]>;
   /** Git objects by lowercase hex sha (blobs, trees, commits). */
   objects: Map<string, GitObject>;
   labels: Map<string, Label>;
@@ -145,6 +149,8 @@ export function createRepo(
     defaultBranch: 'main',
     createdSeq: (store.seq += 1),
     refs: new Map([['main', null]]),
+    tags: new Map(),
+    parents: new Map(),
     objects: new Map(),
     labels: new Map(),
     issues: new Map(),
@@ -179,7 +185,23 @@ interface TreeEntry {
   sha: string;
 }
 
-/** Serialise tree entries the way git does (sorted by name, "<mode> <name>\0" + raw sha). */
+/**
+ * Strip a loose-object header (`<type> <len>\0`) when one is present at the start of the
+ * buffer; otherwise return the buffer unchanged. A raw git tree's first NUL terminates its
+ * first entry (`100644 name\0...`), whose prefix never matches `<type> <len>`, so raw
+ * content is never misdetected as a header. A raw commit has no NUL before its message
+ * text in practice, and a message NUL would not match the pattern either.
+ */
+function stripLooseHeader(data: Buffer): Buffer {
+  const nul = data.indexOf(0);
+  if (nul < 0) return data;
+  const prefix = data.subarray(0, nul).toString('utf8');
+  return /^(blob|tree|commit|tag) \d+$/.test(prefix) ? data.subarray(nul + 1) : data;
+}
+
+/** Serialise tree entries the way git does (sorted by name, "<mode> <name>\0" + raw sha).
+ * Returns the RAW tree content (entries only, no loose-object header): that is what a pack
+ * carries and what hashObject hashes after prepending `tree <len>\0`. */
 export function treeBytes(entries: TreeEntry[]): Buffer {
   const sorted = [...entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   const parts: Buffer[] = [];
@@ -187,8 +209,7 @@ export function treeBytes(entries: TreeEntry[]): Buffer {
     parts.push(Buffer.from(`${entry.mode} ${entry.name}\0`, 'utf8'));
     parts.push(Buffer.from(entry.sha, 'hex'));
   }
-  const body = Buffer.concat(parts);
-  return Buffer.concat([Buffer.from(`tree ${body.length}\0`, 'utf8'), body]);
+  return Buffer.concat(parts);
 }
 
 /**
@@ -220,17 +241,17 @@ export function buildTree(repo: Repo, files: Map<string, string>): string {
     for (const [name, blobSha] of node.files) entries.push({ mode: '100644', name, sha: blobSha });
     for (const [name, child] of node.dirs) entries.push({ mode: '40000', name, sha: build(child) });
     const bytes = treeBytes(entries);
-    const sha = sha1Hex(bytes);
+    const sha = sha1Hex(Buffer.concat([Buffer.from(`tree ${bytes.length}\0`, 'utf8'), bytes]));
     repo.objects.set(sha, { type: 'tree', data: bytes });
     return sha;
   };
   return build(root);
 }
 
-/** Parse a stored tree object back into its entries. */
+/** Parse a stored tree object back into its entries. Stored trees hold raw git content
+ * (entries only); a loose-object header is stripped if one is present (stripLooseHeader). */
 export function parseTree(data: Buffer): TreeEntry[] {
-  const nul = data.indexOf(0);
-  const body = data.subarray(nul + 1);
+  const body = stripLooseHeader(data);
   const entries: TreeEntry[] = [];
   let i = 0;
   while (i < body.length) {
@@ -263,10 +284,9 @@ export function flattenTree(repo: Repo, treeSha: string, prefix = ''): Map<strin
 
 /** Parse a stored commit object: tree, parents, message (author/committer lines ignored). */
 export function parseCommit(data: Buffer): { tree: string; parents: string[]; message: string } {
-  // Strip the "commit <len>\0" object header first: without this the first line reads
-  // "commit <len>\0tree <sha>" and the tree line is never recognised.
-  const nul = data.indexOf(0);
-  const text = data.subarray(nul + 1).toString('utf8');
+  // Stored commits hold raw git content; a loose-object header (`commit <len>\0`) is
+  // stripped if one is present (see stripLooseHeader).
+  const text = stripLooseHeader(data).toString('utf8');
   const headEnd = text.indexOf('\n\n');
   const head = headEnd === -1 ? text : text.slice(0, headEnd);
   const message = headEnd === -1 ? '' : text.slice(headEnd + 2).replace(/\n$/, '');
@@ -294,9 +314,8 @@ export function createCommit(
   if (opts.parent !== null) lines.push(`parent ${opts.parent}`);
   lines.push(`author ${author}`, `committer ${author}`, '', opts.message);
   const body = Buffer.from(lines.join('\n') + '\n', 'utf8');
-  const bytes = Buffer.concat([Buffer.from(`commit ${body.length}\0`, 'utf8'), body]);
-  const sha = sha1Hex(bytes);
-  repo.objects.set(sha, { type: 'commit', data: bytes });
+  const sha = sha1Hex(Buffer.concat([Buffer.from(`commit ${body.length}\0`, 'utf8'), body]));
+  repo.objects.set(sha, { type: 'commit', data: body });
   return sha;
 }
 

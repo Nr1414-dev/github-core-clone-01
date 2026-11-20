@@ -195,6 +195,8 @@ function commitAuthor(data: Buffer): { name: string; email: string; date: string
   const line = text.split('\n').find((l) => l.startsWith('author ')) ?? '';
   const match = /^author (.*) <(.*)> (\d+) ([+-]\d{4})$/.exec(line);
   if (match === null) return { name: VIEWER_LOGIN, email: '', date: trialNowISO() };
+  // Deterministic: the epoch comes from the STORED commit bytes (scenario epoch + seq),
+  // never from the wall clock, so this formats the same value on every replay.
   return {
     name: match[1],
     email: match[2],

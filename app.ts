@@ -20,6 +20,7 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createStore, type Store } from './store.ts';
+import { handleGit } from './git.ts';
 import { handleRest, type RestContext } from './rest.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
@@ -180,7 +181,22 @@ export function createApp(): Server {
             body = parsed.value;
           }
         }
-        void rawBody; // Git smart HTTP (Tahap 2) reads the raw buffer; REST uses `body`.
+        // Git smart HTTP (Tahap 2): binary pkt-line protocol; it writes its own response
+        // (binary or JSON) and returns true when the path is a git path.
+        if (
+          handleGit({
+            store,
+            method,
+            path,
+            query,
+            headers: req.headers,
+            rawBody: rawBody ?? Buffer.alloc(0),
+            res,
+            requestId,
+          })
+        ) {
+          return;
+        }
 
         // REST v3 dispatch: repos, refs, contents, labels, issues.
         const handled = await handleRest({
