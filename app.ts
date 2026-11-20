@@ -22,6 +22,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createStore, type Store } from './store.ts';
 import { handleGit } from './git.ts';
 import { handleMcp } from './mcp.ts';
+import { handleGraphql } from './graphql.ts';
 import { handleRest, type RestContext } from './rest.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
@@ -208,6 +209,21 @@ export function createApp(): Server {
             method,
             path,
             rawBody: rawBody ?? Buffer.alloc(0),
+            res,
+            requestId,
+          })
+        ) {
+          return;
+        }
+
+        // GraphQL (Tahap 5): POST /api/graphql (single or batched operations); it writes
+        // its own {data, errors} envelope. Returns true on /api/graphql paths.
+        if (
+          handleGraphql({
+            store,
+            method,
+            path,
+            body,
             res,
             requestId,
           })

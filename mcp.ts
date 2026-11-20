@@ -251,7 +251,8 @@ function toolErr(message: string): ToolResult {
 // Call a verified REST route with a synthetic context and capture its reply. This is how
 // every tool touches the store: the same validation, number/id allocation, conflict check
 // and squash merge the REST surface uses, so MCP and REST can never diverge.
-async function callRest(
+// (Also used by the GraphQL mutation resolvers — same bridge, same guarantees.)
+export async function callRest(
   store: Store,
   method: string,
   path: string,
@@ -275,7 +276,7 @@ async function callRest(
   return handled ? captured : null;
 }
 
-function restMessage(body: unknown): string {
+export function restMessage(body: unknown): string {
   if (isRecord(body) && typeof body.message === 'string') return body.message;
   return 'Request failed';
 }
