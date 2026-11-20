@@ -19,6 +19,8 @@
 // the starter did; every other /api/v3, /api/graphql, /mcp and *.git path requires it.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createStore, type Store } from './store.ts';
+import { handleRest, type RestContext } from './rest.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 /** Largest request body accepted; anything bigger is a 413 (trial packs are far below this). */
@@ -45,12 +47,13 @@ function sendJson(
   res.end(text);
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
-function pathOf(req: IncomingMessage): string {
+/** The path and query of a request URL (never a throw from a request). */
+function parseRequestUrl(req: IncomingMessage): { path: string; query: URLSearchParams } {
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    const url = new URL(req.url ?? '/', 'http://entry');
+    return { path: url.pathname, query: url.searchParams };
   } catch {
-    return '/';
+    return { path: '/', query: new URLSearchParams() };
   }
 }
 
@@ -124,11 +127,13 @@ function isJsonRoute(path: string): boolean {
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
+  // One store per server: the trial's whole state lives here and nowhere else.
+  const store: Store = createStore();
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     const requestId = `req-${(requestSeq += 1)}`;
     void (async () => {
       try {
-        const path = pathOf(req);
+        const { path, query } = parseRequestUrl(req);
         const method = req.method ?? 'GET';
 
         // The env's boot check calls this twice: 200 {"ok":true}.
@@ -175,10 +180,29 @@ export function createApp(): Server {
             body = parsed.value;
           }
         }
-        void body;
-        void rawBody;
+        void rawBody; // Git smart HTTP (Tahap 2) reads the raw buffer; REST uses `body`.
 
-        // No route implemented yet in Tahap 0: everything else is GitHub's JSON 404.
+        // REST v3 dispatch: repos, refs, contents, labels, issues.
+        const handled = await handleRest({
+          method,
+          path,
+          query,
+          body,
+          requestId,
+          host: typeof req.headers.host === 'string' ? req.headers.host : '127.0.0.1',
+          store,
+          reply: (status: number, replyBody: unknown, headers: Record<string, string> = {}) => {
+            if (replyBody === null) {
+              res.writeHead(status, { 'x-github-request-id': requestId, ...headers });
+              res.end();
+              return;
+            }
+            sendJson(res, requestId, status, replyBody, headers);
+          },
+        } satisfies RestContext);
+        if (handled) return;
+
+        // No route implemented for this path: GitHub's JSON 404.
         sendJson(res, requestId, 404, { message: 'Not Found' });
       } catch {
         // Never let one bad request kill the process: answer 500 and keep serving.
